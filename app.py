@@ -1,4 +1,5 @@
-from flask import Flask, render_template, jsonify, request
+from functools import lru_cache
+from flask import Flask, render_template, request
 from src.helper import download_hugging_face_embeddings
 from langchain_pinecone import PineconeVectorStore
 from langchain_openai import ChatOpenAI
@@ -12,40 +13,43 @@ import os
 
 app = Flask(__name__)
 
-
 load_dotenv()
 
-PINECONE_API_KEY=os.environ.get('PINECONE_API_KEY')
-OPENAI_API_KEY=os.environ.get('OPENAI_API_KEY')
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+if PINECONE_API_KEY:
+    os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
+if OPENAI_API_KEY:
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
-
-embeddings = download_hugging_face_embeddings()
-
-index_name = "medical-chatbot" 
-# Embed each chunk and upsert the embeddings into your Pinecone index.
-docsearch = PineconeVectorStore.from_existing_index(
-    index_name=index_name,
-    embedding=embeddings
-)
+INDEX_NAME = "medical-chatbot"
 
 
+@lru_cache(maxsize=1)
+def get_rag_chain():
+    """
+    Lazily build and cache the retrieval chain so the server can start
+    instantly while heavy resources (embeddings/model/index lookups) are
+    initialized only on demand.
+    """
+    embeddings = download_hugging_face_embeddings()
+    docsearch = PineconeVectorStore.from_existing_index(
+        index_name=INDEX_NAME,
+        embedding=embeddings
+    )
+    retriever = docsearch.as_retriever(search_type="similarity", search_kwargs={"k": 3})
 
+    chat_model = ChatOpenAI(model="gpt-4o")
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            ("human", "{input}"),
+        ]
+    )
 
-retriever = docsearch.as_retriever(search_type="similarity", search_kwargs={"k":3})
-
-chatModel = ChatOpenAI(model="gpt-4o")
-prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", system_prompt),
-        ("human", "{input}"),
-    ]
-)
-
-question_answer_chain = create_stuff_documents_chain(chatModel, prompt)
-rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+    question_answer_chain = create_stuff_documents_chain(chat_model, prompt)
+    return create_retrieval_chain(retriever, question_answer_chain)
 
 
 
@@ -57,10 +61,10 @@ def index():
 
 @app.route("/get", methods=["GET", "POST"])
 def chat():
-    msg = request.form["msg"]
-    input = msg
-    print(input)
-    response = rag_chain.invoke({"input": msg})
+    user_message = request.form["msg"]
+    print(user_message)
+    rag_chain = get_rag_chain()
+    response = rag_chain.invoke({"input": user_message})
     print("Response : ", response["answer"])
     return str(response["answer"])
 
